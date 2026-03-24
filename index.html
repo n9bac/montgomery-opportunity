@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Montgomery Opportunity Explorer</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #map { height: 100vh; width: 100%; background: #f1f5f9; }
+        .custom-tooltip { 
+            background: white !important; 
+            border: none !important; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1) !important;
+            border-radius: 12px !important; 
+            padding: 15px !important;
+            white-space: normal !important;
+            overflow-wrap: break-word !important;
+            min-width: 220px !important;
+            max-width: 300px !important;
+        }
+        .animate-spin { animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-slate-50 font-sans antialiased">
+    <div id="root"></div>
+
+    <!-- React, ReactDOM, Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Leaflet and Turf -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // API Key
+        const CENSUS_API_KEY = "c113b395a568d62a02db2a565e8e600f5e1ae9f1";
+
+        function App() {
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+            const [viewMode, setViewMode] = useState('opportunity');
+            const mapRef = useRef(null);
+            const geoJsonLayerRef = useRef(null);
+
+            const normalize = (val, min, max) => (max === min) ? 0 : (val - min) / (max - min);
+
+            const getColor = (val, mode) => {
+                const numVal = typeof val === 'string' ? parseFloat(val) : val;
+                if (mode === 'income') {
+                    return numVal > 80000 ? '#065f46' : numVal > 60000 ? '#059669' : numVal > 40000 ? '#34d399' : numVal > 20000 ? '#a7f3d0' : '#ecfdf5';
+                }
+                return numVal > 0.8 ? '#5b21b6' : numVal > 0.6 ? '#7c3aed' : numVal > 0.4 ? '#a78bfa' : numVal > 0.2 ? '#ddd6fe' : '#f5f3ff';
+            };
+
+            const fetchBizData = async () => {
+                const baseUrl = "https://gis.montgomeryal.gov/server/rest/services/HostedDatasets/Business_License/MapServer/0/query";
+                const queryParams = "where=1%3D1&outFields=OBJECTID,Id,custCOMPANY_NAME,scCODE,scNAME,Full_Address&returnGeometry=true&outSR=4326&f=json&orderByFields=OBJECTID";
+                
+                let offset = 0;
+                const pageSize = 2000;
+                let allFeatures = [];
+                let hasMore = true;
+
+                while (hasMore) {
+                    const queryUrl = `${baseUrl}?${queryParams}&resultOffset=${offset}&resultRecordCount=${pageSize}`;
+                    const response = await fetch(queryUrl);
+                    if (!response.ok) throw new Error("Business data fetch failed");
+                    const data = await response.json();
+
+                    if (data.features && data.features.length > 0) {
+                        const geoJsonFeatures = data.features
+                            .filter(f => f.geometry && typeof f.geometry.x === 'number')
+                            .map(f => ({
+                                type: "Feature",
+                                geometry: { type: "Point", coordinates: [f.geometry.x, f.geometry.y] },
+                                properties: f.attributes
+                            }));
+                        allFeatures = allFeatures.concat(geoJsonFeatures);
+                        if (data.features.length < pageSize) hasMore = false;
+                        else offset += pageSize;
+                    } else {
+                        hasMore = false;
+                    }
+                }
+                return { type: "FeatureCollection", features: allFeatures };
+            };
+
+            const fetchAndProcessData = async () => {
+                try {
+                    setLoading(true);
+                    
+                    // 1. Fetch ACS
+                    const acsUrl = `https://api.census.gov/data/2022/acs/acs5?get=NAME,B19013_001E,B01002_001E,B01003_001E,B15003_001E,B15003_022E&for=tract:*&in=state:01&in=county:101&key=${CENSUS_API_KEY}`;
+                    const acsRes = await fetch(acsUrl);
+                    if (!acsRes.ok) throw new Error("Census API failed");
+                    const acsJson = await acsRes.json();
+
+                    // 2. Fetch TIGER
+                    const tigerUrl = `https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Tracts_Blocks/MapServer/4/query?where=STATE%3D'01'%20AND%20COUNTY%3D'101'&outFields=GEOID,TRACT&returnGeometry=true&outSR=4326&f=geojson`;
+                    const tigerRes = await fetch(tigerUrl);
+                    if (!tigerRes.ok) throw new Error("TIGER geometry fetch failed");
+                    const tigerGeo = await tigerRes.json();
+
+                    // 3. Fetch Business Data (Paginated)
+                    const bizGeo = await fetchBizData();
+
+                    // 4. Process
+                    const demoMap = new Map();
+                    acsJson.slice(1).forEach(r => {
+                        const total25 = parseFloat(r[4]);
+                        const bach = parseFloat(r[5]);
+                        const bachPct = total25 > 0 ? (bach / total25) * 100 : 0;
+                        demoMap.set(`${r[6]}${r[7]}${r[8]}`, { 
+                            income: parseFloat(r[1]), 
+                            age: parseFloat(r[2]), 
+                            pop: parseInt(r[3]),
+                            bachelors: bachPct
+                        });
+                    });
+
+                    const rawValues = tigerGeo.features.map(f => {
+                        const d = demoMap.get(f.properties.GEOID) || { income: 0, pop: 0, age: 0, bachelors: 0 };
+                        const ptsInTract = turf.pointsWithinPolygon(bizGeo, f);
+                        const bizCount = ptsInTract.features.length;
+                        const area = turf.area(f) / 1000000;
+                        const bizDensity = area > 0 ? bizCount / area : 0;
+                        return { ...f.properties, ...d, bizCount, bizDensity, area };
+                    });
+
+                    const incomes = rawValues.map(v => v.income).filter(v => !isNaN(v));
+                    const maxIncome = Math.max(...incomes, 0);
+                    const minIncome = Math.min(...incomes, 0);
+                    
+                    const pops = rawValues.map(v => v.pop).filter(v => !isNaN(v));
+                    const maxPop = Math.max(...pops, 0);
+                    const minPop = Math.min(...pops, 0);
+                    
+                    const densities = rawValues.map(v => v.bizDensity).filter(v => !isNaN(v));
+                    const maxDens = Math.max(...densities, 0);
+                    const minDens = Math.min(...densities, 0);
+
+                    tigerGeo.features = tigerGeo.features.map((f, i) => {
+                        const v = rawValues[i];
+                        const normInc = normalize(v.income, minIncome, maxIncome);
+                        const normPop = normalize(v.pop, minPop, maxPop);
+                        const normDens = normalize(v.bizDensity, minDens, maxDens);
+                        
+                        const demand = (0.5 * normPop) + (0.5 * normInc);
+                        const gap = demand * (1 - normDens);
+                        const attractiveness = (0.6 * normDens) + (0.4 * demand);
+
+                        f.properties = {
+                            ...v,
+                            normBizDensity: normDens,
+                            demandScore: demand.toFixed(3),
+                            competitionGap: gap.toFixed(3),
+                            opportunityScore: gap.toFixed(3),
+                            attractivenessScore: attractiveness.toFixed(3)
+                        };
+                        return f;
+                    });
+
+                    renderMap(tigerGeo);
+                    setLoading(false);
+                } catch (err) {
+                    console.error(err);
+                    setError(err.message);
+                    setLoading(false);
+                }
+            };
+
+            const renderMap = (data) => {
+                if (!mapRef.current) return;
+                if (geoJsonLayerRef.current) mapRef.current.removeLayer(geoJsonLayerRef.current);
+
+                geoJsonLayerRef.current = L.geoJson(data, {
+                    style: (f) => ({
+                        fillColor: getColor(f.properties.opportunityScore, 'opportunity'),
+                        weight: 1.5, color: 'white', fillOpacity: 0.8
+                    }),
+                    onEachFeature: (f, layer) => {
+                        const p = f.properties;
+                        layer.bindTooltip(`
+                            <div class="space-y-2">
+                                <b class="text-slate-800 border-b block pb-1">Tract ${p.TRACT}</b>
+                                <div class="space-y-1 text-[11px]">
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Median Income:</span> <span class="font-bold">$${(p.income || 0).toLocaleString()}</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Population:</span> <span class="font-bold">${(p.pop || 0).toLocaleString()}</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Median Age:</span> <span class="font-bold">${(p.age || 0).toFixed(1)}</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Bachelors %:</span> <span class="font-bold">${(p.bachelors || 0).toFixed(1)}%</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Business Count:</span> <span class="font-bold">${p.bizCount}</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Business Presence:</span> <span class="font-bold">${(p.bizDensity || 0).toFixed(2)} /km²</span></div>
+                                    <div class="flex justify-between gap-4"><span class="text-slate-500">Relative Business Presence:</span> <span class="font-bold">${((p.normBizDensity || 0) * 100).toFixed(1)}%</span></div>
+                                </div>
+                                <div class="pt-1 border-t mt-1 space-y-1">
+                                    <div class="flex justify-between text-[11px]">
+                                        <span>Customer Potential:</span> <span class="font-bold text-blue-600">${p.demandScore}</span>
+                                    </div>
+                                    <div class="flex justify-between text-[11px]">
+                                        <span>Unmet Demand:</span> <span class="font-bold text-orange-600">${p.competitionGap}</span>
+                                    </div>
+                                    <div class="flex justify-between text-[11px]">
+                                        <span>Opportunity Score:</span> <span class="font-bold text-purple-700 bg-purple-50 px-1 rounded">${p.opportunityScore}</span>
+                                    </div>
+                                    <div class="flex justify-between text-[11px]">
+                                        <span>Attractiveness Score:</span> <span class="font-bold text-emerald-700 bg-emerald-50 px-1 rounded">${p.attractivenessScore}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `, { sticky: true, className: 'custom-tooltip' });
+                    }
+                }).addTo(mapRef.current);
+            };
+
+            useEffect(() => {
+                mapRef.current = L.map('map', { zoomControl: false }).setView([32.3668, -86.3000], 11);
+                L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+                    attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+                }).addTo(mapRef.current);
+                fetchAndProcessData();
+                return () => mapRef.current.remove();
+            }, []);
+
+            useEffect(() => {
+                if (geoJsonLayerRef.current) {
+                    geoJsonLayerRef.current.eachLayer((layer) => {
+                        const props = layer.feature.properties;
+                        const val = viewMode === 'income' ? props.income : props.opportunityScore;
+                        layer.setStyle({ fillColor: getColor(val, viewMode) });
+                    });
+                }
+            }, [viewMode]);
+
+            return (
+                <div className="relative w-full h-screen overflow-hidden">
+                    <div className="absolute top-4 left-4 z-[1000] bg-white/95 p-5 rounded-2xl shadow-2xl border border-slate-200 w-72">
+                        <h1 className="font-black text-slate-800 text-xl tracking-tight">Montgomery Opportunity</h1>
+                        <p className="text-[10px] text-slate-400 font-bold uppercase mb-4 tracking-widest">Spatial Census Explorer</p>
+                        
+                        <div className="bg-slate-50 p-1 rounded-lg flex mb-2 border">
+                            <button 
+                                onClick={() => setViewMode('opportunity')}
+                                className={`flex-1 text-[10px] py-1.5 rounded-md font-bold transition ${viewMode === 'opportunity' ? 'bg-white shadow text-purple-700' : 'text-slate-400'}`}>
+                                UNDERSERVED DEMAND
+                            </button>
+                            <button 
+                                onClick={() => setViewMode('income')}
+                                className={`flex-1 text-[10px] py-1.5 rounded-md font-bold transition ${viewMode === 'income' ? 'bg-white shadow text-emerald-700' : 'text-slate-400'}`}>
+                                SPENDING POWER
+                            </button>
+                        </div>
+
+                        <p className="text-[11px] text-slate-500 italic mb-4 leading-tight">
+                            {viewMode === 'income' ? 'Where people have strong purchasing capacity' : 'Where demand is high but competition is limited'}
+                        </p>
+
+                        <div className="space-y-2">
+                            <p className="text-[10px] font-black text-slate-400 uppercase">{viewMode === 'income' ? 'Spending Power' : 'Opportunity Score'}</p>
+                            {[0.8, 0.6, 0.4, 0.2, 0].map(val => (
+                                <div key={val} className="flex items-center gap-3 text-[11px] font-medium text-slate-600">
+                                    <div className="w-3 h-3 rounded-sm shadow-sm" style={{background: getColor(viewMode === 'income' ? (val + 0.1) * 100000 : val + 0.1, viewMode)}}></div>
+                                    <span>{viewMode === 'income' ? `$${(val*100000).toLocaleString()}+` : (val + 0.2).toFixed(1)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {loading && (
+                        <div className="absolute inset-0 z-[2000] bg-white flex flex-col items-center justify-center">
+                            <div className="w-10 h-10 border-4 border-purple-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+                            <span className="font-black text-slate-700 uppercase tracking-widest text-xs">Loading Data...</span>
+                        </div>
+                    )}
+
+                    {error && (
+                        <div className="absolute inset-0 z-[2000] bg-white/90 flex flex-col items-center justify-center p-8 text-center">
+                            <div className="bg-white p-8 rounded-3xl shadow-2xl border border-red-100 max-w-md">
+                                <h2 className="text-xl font-black text-slate-800 mb-2 uppercase tracking-tight text-red-600">Error</h2>
+                                <p className="text-slate-500 text-sm mb-6 leading-relaxed">{error}</p>
+                                <button onClick={() => window.location.reload()} className="w-full bg-slate-800 text-white font-bold py-3 rounded-xl">RELOAD</button>
+                            </div>
+                        </div>
+                    )}
+                    <div id="map"></div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
